@@ -30,8 +30,8 @@ public class S3SmartCache : IDisposable
     // Large file threshold for streaming (100MB)
     private const long STREAMING_THRESHOLD = 100 * 1024 * 1024;
     
-    // Small file threshold - files smaller than this are downloaded immediately (5MB)
-    private const long SMALL_FILE_THRESHOLD = 5 * 1024 * 1024;
+    // All files start as placeholders - NO auto-download
+    // Files are only downloaded when actually opened
 
     // P/Invoke for creating sparse files
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
@@ -147,58 +147,16 @@ public class S3SmartCache : IDisposable
                     ETag = obj.ETag ?? string.Empty
                 };
 
-                // Create placeholder file - DO NOT use Offline attribute as it prevents reading
+                // Create placeholder for ALL files - no auto-download
                 if (!File.Exists(localPath))
                 {
                     var fileSize = obj.Size.GetValueOrDefault(0);
                     
-                    // Download small files (< 5MB) immediately for instant access
-                    // This includes most images, documents, etc.
-                    if (fileSize > 0 && fileSize <= SMALL_FILE_THRESHOLD)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"S3Cache - Small file, downloading immediately: {key} ({fileSize / 1024}KB)");
-                        
-                        try
-                        {
-                            using var s3Stream = await _s3Service.GetObjectStreamAsync(key);
-                            if (s3Stream != null)
-                            {
-                                using var fileStream = File.Create(localPath);
-                                await s3Stream.CopyToAsync(fileStream);
-                                
-                                File.SetAttributes(localPath, FileAttributes.Normal);
-                                
-                                if (obj.LastModified.HasValue)
-                                {
-                                    File.SetCreationTime(localPath, obj.LastModified.Value);
-                                    File.SetLastWriteTime(localPath, obj.LastModified.Value);
-                                }
-                                
-                                _activeFiles[key] = new FileWatcher
-                                {
-                                    LocalPath = localPath,
-                                    Key = key,
-                                    LastAccess = DateTime.Now,
-                                    Size = fileSize
-                                };
-                                
-                                filesCreated++;
-                                System.Diagnostics.Debug.WriteLine($"S3Cache - Small file ready: {key}");
-                                continue; // Skip creating placeholder
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"S3Cache - Failed to download small file: {ex.Message}");
-                        }
-                    }
-                    
-                    // For larger files, create empty placeholder WITHOUT Offline attribute
-                    // This allows the file to be opened, triggering a download
+                    // Create empty placeholder for ALL files
+                    // Files will be downloaded ONLY when opened
                     File.WriteAllBytes(localPath, Array.Empty<byte>());
                     
-                    // Use Hidden + System attributes to mark as placeholder internally
-                    // Don't use Offline as it prevents reading
+                    // Use Hidden + System attributes to mark as placeholder
                     File.SetAttributes(localPath, FileAttributes.Hidden | FileAttributes.System);
                     
                     // Set file time to match S3
@@ -274,13 +232,13 @@ public class S3SmartCache : IDisposable
         
         System.Diagnostics.Debug.WriteLine("S3Cache - File watcher enabled");
         
-        // Start polling timer to check for file access (every 500ms)
-        // This handles cases where FileSystemWatcher doesn't detect reads
+        // Aggressive polling timer to detect file opens (every 200ms)
+        // This ensures we catch when Explorer or apps try to open placeholder files
         _pollingTimer = new Timer(
             callback: _ => CheckForFileAccess(),
             state: null,
-            dueTime: TimeSpan.FromSeconds(1),
-            period: TimeSpan.FromMilliseconds(500));
+            dueTime: TimeSpan.FromMilliseconds(500),
+            period: TimeSpan.FromMilliseconds(200));
     }
     
     private void CheckForFileAccess()
@@ -316,16 +274,32 @@ public class S3SmartCache : IDisposable
                     if (_downloadingFiles.Contains(key))
                         continue;
                     
-                    // Try to open the file to see if someone is accessing it
-                    // This will fail if file is locked by another process
+                    // Check if LastAccessTime changed (indicates someone accessed it)
+                    if (_lastAccessCheck.TryGetValue(key, out var lastCheck))
+                    {
+                        if (fileInfo.LastAccessTime > lastCheck.AddMilliseconds(100))
+                        {
+                            System.Diagnostics.Debug.WriteLine($"S3Cache - File access detected (LastAccessTime): {fileInfo.Name}");
+                            _lastAccessCheck[key] = fileInfo.LastAccessTime;
+                            _ = Task.Run(async () => await DownloadFileOnDemandAsync(filePath, key));
+                            continue;
+                        }
+                    }
+                    
+                    // Update last access check time
+                    _lastAccessCheck[key] = fileInfo.LastAccessTime;
+                    
+                    // Also try to detect if file is locked (being opened)
                     try
                     {
-                        using var testStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Write | FileShare.Delete, 1, FileOptions.Asynchronous);
-                        // If we can open it, no one else is trying to access it
+                        // Try to open with exclusive access
+                        using var testStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, 
+                            FileShare.None, 1, FileOptions.Asynchronous);
+                        // Successfully opened with exclusive access - no one else accessing
                     }
                     catch (IOException)
                     {
-                        // File is locked - someone is trying to access it!
+                        // File is locked - someone is trying to open it!
                         System.Diagnostics.Debug.WriteLine($"S3Cache - File access detected (locked): {fileInfo.Name}");
                         _ = Task.Run(async () => await DownloadFileOnDemandAsync(filePath, key));
                     }
@@ -547,14 +521,18 @@ public class S3SmartCache : IDisposable
 
         try
         {
-            // Check if this is a large file that should use streaming
-            if (_fileMetadata.TryGetValue(key, out var metadata) && 
-                metadata.Size > STREAMING_THRESHOLD && 
-                _streamingHandler != null)
+            // Get file metadata
+            _fileMetadata.TryGetValue(key, out var metadata);
+            var fileSize = metadata?.Size ?? 0;
+            
+            System.Diagnostics.Debug.WriteLine($"S3Cache - File opened, downloading: {key} ({fileSize / 1024}KB)");
+            
+            // For video files over 100MB, use streaming
+            if (fileSize > STREAMING_THRESHOLD && _streamingHandler != null)
             {
-                System.Diagnostics.Debug.WriteLine($"S3Cache - Using streaming for large file: {key} ({metadata.Size / 1024 / 1024}MB)");
+                System.Diagnostics.Debug.WriteLine($"S3Cache - Using streaming for large file: {key} ({fileSize / 1024 / 1024}MB)");
                 
-                // Fetch initial chunk (first 10MB) for quick access
+                // Fetch initial chunk (first 10MB) for quick playback
                 await _streamingHandler.FetchRangeAsync(key, 0, 10 * 1024 * 1024);
                 
                 // Prefetch next chunk in background
@@ -569,13 +547,15 @@ public class S3SmartCache : IDisposable
                     LocalPath = localPath,
                     Key = key,
                     LastAccess = DateTime.Now,
-                    Size = metadata.Size
+                    Size = fileSize
                 };
                 
+                System.Diagnostics.Debug.WriteLine($"S3Cache - Streaming ready for: {key}");
                 return;
             }
 
-            System.Diagnostics.Debug.WriteLine($"S3Cache - Downloading: {key}");
+            // For all other files, download completely
+            System.Diagnostics.Debug.WriteLine($"S3Cache - Downloading complete file: {key}");
 
             // Download from S3
             using var s3Stream = await _s3Service.GetObjectStreamAsync(key);
@@ -638,7 +618,7 @@ public class S3SmartCache : IDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"S3Cache - Download failed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"S3Cache - Download failed for {key}: {ex.Message}");
         }
         finally
         {
@@ -785,9 +765,7 @@ public class S3SmartCache : IDisposable
             }
 
             if (staleFiles.Count > 0)
-            {
-                System.Diagnostics.Debug.WriteLine($"S3Cache - Cleaned up {staleFiles.Count} stale files");
-            }
+            System.Diagnostics.Debug.WriteLine($"S3Cache - Cleaned up {staleFiles.Count} stale files");
         }
         catch (Exception ex)
         {
