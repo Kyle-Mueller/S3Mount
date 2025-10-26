@@ -17,18 +17,19 @@ namespace S3Mount
         private TaskbarIcon? _trayIcon;
         private MainWindow? _mainWindow;
         private CredentialService? _credentialService;
-        private S3Service? _s3Service;
         private VirtualDriveService? _driveService;
         private MainViewModel? _mainViewModel;
+        private LogService _log = LogService.Instance;
         
         private async void Application_Startup(object sender, StartupEventArgs e)
         {
             try
             {
+                _log.Info("🚀 Application starting up");
+                
                 // Initialize services
                 _credentialService = new CredentialService();
-                _s3Service = new S3Service();
-                _driveService = new VirtualDriveService(_s3Service, _credentialService);
+                _driveService = new VirtualDriveService(_credentialService);
                 
                 // Initialize ViewModel
                 _mainViewModel = new MainViewModel(_credentialService, _driveService);
@@ -69,7 +70,7 @@ namespace S3Mount
                     _trayIcon.ContextMenu = contextMenu;
                     _trayIcon.TrayLeftMouseUp += TrayIcon_TrayLeftMouseUp;
                     
-                    System.Diagnostics.Debug.WriteLine($"Tray icon resource load failed: {ex.Message}");
+                    _log.Warning($"⚠️ Tray icon resource load failed: {ex.Message}");
                 }
                 
                 // Create main window but don't show it yet
@@ -92,9 +93,12 @@ namespace S3Mount
                     // Mounts exist, start in tray
                     ShowTrayNotification("S3 Mount Manager", $"Application started. {configs.Count} mount(s) configured.");
                 }
+                
+                _log.Success("✅ Application started successfully");
             }
             catch (Exception ex)
             {
+                _log.Error($"❌ Startup error: {ex.Message}");
                 Helpers.DarkMessageBox.Show(
                     $"Error starting application: {ex.Message}\n\nStack Trace:\n{ex.StackTrace}",
                     "Startup Error",
@@ -124,28 +128,33 @@ namespace S3Mount
                     if (File.Exists(iconPath))
                     {
                         _trayIcon.IconSource = new BitmapImage(new Uri(iconPath, UriKind.Absolute));
-                        System.Diagnostics.Debug.WriteLine($"Loaded tray icon from: {iconPath}");
+                        _log.Debug($"📦 Loaded tray icon from: {iconPath}");
                         return;
                     }
                 }
                 
-                System.Diagnostics.Debug.WriteLine("No icon file found. Application will run with default system icon.");
+                _log.Warning("⚠️ No icon file found. Application will run with default system icon.");
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Failed to load tray icon: {ex.Message}");
-                // Continue without icon - not a critical error
+                _log.Warning($"⚠️ Failed to load tray icon: {ex.Message}");
             }
         }
         
-        private void Application_Exit(object sender, ExitEventArgs e)
+        private async void Application_Exit(object sender, ExitEventArgs e)
         {
+            _log.Info("🔻 Application exiting");
+            
             // Unmount all drives on exit
-            _driveService?.UnmountAllDrives();
+            if (_driveService != null)
+            {
+                await _driveService.UnmountAllDrives();
+            }
             
             // Cleanup
             _trayIcon?.Dispose();
-            _s3Service?.Dispose();
+            
+            _log.Info("👋 Application closed");
         }
         
         private void TrayIcon_TrayLeftMouseUp(object sender, RoutedEventArgs e)
@@ -158,10 +167,15 @@ namespace S3Mount
             ShowMainWindow();
         }
         
-        private void Exit_Click(object sender, RoutedEventArgs e)
+        private async void Exit_Click(object sender, RoutedEventArgs e)
         {
+            _log.Info("🛑 Exit requested from tray");
+            
             // Actually exit the application
-            _driveService?.UnmountAllDrives();
+            if (_driveService != null)
+            {
+                await _driveService.UnmountAllDrives();
+            }
             Shutdown();
         }
         
@@ -187,11 +201,13 @@ namespace S3Mount
             }
         }
         
-        protected override void OnExit(ExitEventArgs e)
+        protected override async void OnExit(ExitEventArgs e)
         {
-            _driveService?.UnmountAllDrives();
+            if (_driveService != null)
+            {
+                await _driveService.UnmountAllDrives();
+            }
             _trayIcon?.Dispose();
-            _s3Service?.Dispose();
             base.OnExit(e);
         }
     }

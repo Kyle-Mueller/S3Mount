@@ -4,16 +4,24 @@ using System.Runtime.InteropServices;
 
 namespace S3Mount.Services;
 
+/// <summary>
+/// Service for managing virtual drive mounting using rclone
+/// </summary>
 public class VirtualDriveService
 {
-    private readonly S3Service _s3Service;
+    private readonly RcloneService _rcloneService;
+    private readonly CredentialManagerService _credentialManager;
     private readonly CredentialService _credentialService;
+    private readonly LogService _log = LogService.Instance;
     private readonly Dictionary<Guid, DriveMapping> _activeMounts = new();
     
-    public VirtualDriveService(S3Service s3Service, CredentialService credentialService)
+    public VirtualDriveService(CredentialService credentialService)
     {
-        _s3Service = s3Service;
+        _rcloneService = new RcloneService();
+        _credentialManager = new CredentialManagerService();
         _credentialService = credentialService;
+        
+        _log.Info("?? VirtualDriveService initialized");
     }
     
     public List<string> GetAvailableDriveLetters()
@@ -37,20 +45,18 @@ public class VirtualDriveService
     {
         if (_activeMounts.ContainsKey(config.Id))
         {
-            System.Diagnostics.Debug.WriteLine($"Mount already exists for {config.MountName}");
+            _log.Warning($"?? Mount already exists for {config.MountName}");
             return false;
         }
             
         try
         {
-            // Initialize S3 connection
-            var s3Service = new S3Service();
-            s3Service.Initialize(config);
+            _log.Info($"?? Starting mount process for {config.MountName}");
             
-            // Test connection
-            if (!await s3Service.TestConnectionAsync())
+            // Check rclone availability
+            if (!_rcloneService.IsRcloneAvailable())
             {
-                System.Diagnostics.Debug.WriteLine($"S3 connection test failed for {config.MountName}");
+                _log.Error("? rclone.exe not found");
                 return false;
             }
             
@@ -58,40 +64,59 @@ public class VirtualDriveService
             var driveLetter = GetAvailableDriveLetter(config.DriveLetter);
             if (string.IsNullOrEmpty(driveLetter))
             {
-                System.Diagnostics.Debug.WriteLine("No available drive letters");
+                _log.Error("? No available drive letters");
                 return false;
             }
             
-            System.Diagnostics.Debug.WriteLine($"Mounting {config.MountName} to {driveLetter} using Smart Cache");
+            // Remove colon for remote name
+            var remoteName = $"{config.MountName.Replace(" ", "_")}_{driveLetter.TrimEnd(':')}";
             
-            // Create cache root directory
-            var cacheRoot = Path.Combine(Path.GetTempPath(), "S3Mount_Cache", config.BucketName + "_" + config.Id.ToString("N").Substring(0, 8));
-            Directory.CreateDirectory(cacheRoot);
+            // Store credentials in Windows Credential Manager
+            _credentialManager.StoreCredentials(
+                remoteName,
+                config.AccessKey,
+                config.SecretKey
+            );
             
-            System.Diagnostics.Debug.WriteLine($"Cache root: {cacheRoot}");
+            // Configure rclone remote
+            var configured = await _rcloneService.ConfigureRemoteAsync(
+                remoteName,
+                config.ProviderName,
+                config.ServiceUrl,
+                config.Region,
+                config.AccessKey,
+                config.SecretKey,
+                config.ForcePathStyle
+            );
             
-            // Create and initialize smart cache
-            var smartCache = new S3SmartCache(s3Service, config, cacheRoot);
-            
-            if (!await smartCache.InitializeCacheAsync())
+            if (!configured)
             {
-                System.Diagnostics.Debug.WriteLine("Failed to initialize smart cache");
+                _log.Error($"? Failed to configure remote for {config.MountName}");
+                _credentialManager.DeleteCredentials(remoteName);
                 return false;
             }
             
-            // Create subst drive pointing to cache root
-            var result = MapNetworkDrive(driveLetter, config.MountName, cacheRoot);
+            // Test connection
+            var connected = await _rcloneService.TestConnectionAsync(remoteName, config.BucketName);
+            if (!connected)
+            {
+                _log.Error($"? Connection test failed for {config.MountName}");
+                await _rcloneService.RemoveRemoteAsync(remoteName);
+                _credentialManager.DeleteCredentials(remoteName);
+                return false;
+            }
             
-            if (result)
+            // Mount using rclone
+            var mounted = await _rcloneService.MountAsync(remoteName, config.BucketName, driveLetter.TrimEnd(':'));
+            
+            if (mounted)
             {
                 _activeMounts[config.Id] = new DriveMapping
                 {
                     ConfigId = config.Id,
                     DriveLetter = driveLetter,
                     MountName = config.MountName,
-                    CacheRoot = cacheRoot,
-                    SmartCache = smartCache,
-                    S3Service = s3Service
+                    RemoteName = remoteName
                 };
                 
                 // Update configuration
@@ -99,50 +124,41 @@ public class VirtualDriveService
                 config.DriveLetter = driveLetter;
                 _credentialService.SaveConfiguration(config);
                 
-                // Set drive label to mount name
+                // Set drive label
                 SetDriveLabel(driveLetter, config.MountName);
                 
-                // Set custom icon if specified
-                if (!string.IsNullOrEmpty(config.IconPath) && File.Exists(config.IconPath))
-                {
-                    SetDriveIcon(driveLetter, config.IconPath);
-                }
-                
-                System.Diagnostics.Debug.WriteLine($"Successfully mounted {config.MountName} to {driveLetter} with Smart Cache");
+                _log.Success($"? Successfully mounted {config.MountName} to {driveLetter}");
+                return true;
             }
             else
             {
-                // Failed to create drive, dispose cache
-                smartCache.Dispose();
-                System.Diagnostics.Debug.WriteLine($"Failed to create drive mapping for {config.MountName}");
+                _log.Error($"? Failed to mount {config.MountName}");
+                await _rcloneService.RemoveRemoteAsync(remoteName);
+                _credentialManager.DeleteCredentials(remoteName);
+                return false;
             }
-            
-            return result;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Mount failed: {ex.Message}\n{ex.StackTrace}");
+            _log.Error($"? Mount failed: {ex.Message}");
             return false;
         }
     }
     
-    public bool UnmountDrive(Guid configId)
+    public async Task<bool> UnmountDrive(Guid configId)
     {
-        System.Diagnostics.Debug.WriteLine($"UnmountDrive called for config ID: {configId}");
+        _log.Info($"?? UnmountDrive called for config ID: {configId}");
         
         if (!_activeMounts.TryGetValue(configId, out var mapping))
         {
-            System.Diagnostics.Debug.WriteLine($"No active mount found for config ID: {configId}");
+            _log.Warning($"?? No active mount found for config ID: {configId}");
             
-            // Check if config exists and try to unmount anyway
+            // Check if config exists and update status
             var config = _credentialService.GetConfiguration(configId);
-            if (config != null && !string.IsNullOrEmpty(config.DriveLetter))
+            if (config != null)
             {
-                System.Diagnostics.Debug.WriteLine($"Attempting to unmount drive {config.DriveLetter} anyway");
-                DisconnectNetworkDrive(config.DriveLetter);
                 config.IsMounted = false;
                 _credentialService.SaveConfiguration(config);
-                return true;
             }
             
             return false;
@@ -150,34 +166,16 @@ public class VirtualDriveService
             
         try
         {
-            System.Diagnostics.Debug.WriteLine($"Unmounting {mapping.MountName} from {mapping.DriveLetter}");
+            _log.Info($"?? Unmounting {mapping.MountName} from {mapping.DriveLetter}");
             
-            // Disconnect network drive first
-            DisconnectNetworkDrive(mapping.DriveLetter);
+            // Unmount using rclone
+            await _rcloneService.UnmountAsync(mapping.RemoteName, mapping.DriveLetter.TrimEnd(':'));
             
-            // Dispose smart cache (this purges all cached files)
-            if (mapping.SmartCache != null)
-            {
-                System.Diagnostics.Debug.WriteLine("Disposing smart cache and purging files");
-                mapping.SmartCache.Dispose();
-            }
+            // Remove remote configuration
+            await _rcloneService.RemoveRemoteAsync(mapping.RemoteName);
             
-            // Dispose S3 service
-            mapping.S3Service?.Dispose();
-            
-            // Clean up cache directory
-            if (!string.IsNullOrEmpty(mapping.CacheRoot) && Directory.Exists(mapping.CacheRoot))
-            {
-                try
-                {
-                    System.Diagnostics.Debug.WriteLine($"Deleting cache directory: {mapping.CacheRoot}");
-                    Directory.Delete(mapping.CacheRoot, true);
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Failed to delete cache directory: {ex.Message}");
-                }
-            }
+            // Delete credentials
+            _credentialManager.DeleteCredentials(mapping.RemoteName);
             
             _activeMounts.Remove(configId);
             
@@ -187,26 +185,30 @@ public class VirtualDriveService
             {
                 config.IsMounted = false;
                 _credentialService.SaveConfiguration(config);
-                System.Diagnostics.Debug.WriteLine($"Successfully unmounted {mapping.MountName}");
             }
             
+            _log.Success($"? Successfully unmounted {mapping.MountName}");
             return true;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Unmount failed: {ex.Message}");
+            _log.Error($"? Unmount failed: {ex.Message}");
             return false;
         }
     }
     
-    public void UnmountAllDrives()
+    public async Task UnmountAllDrives()
     {
-        System.Diagnostics.Debug.WriteLine("Unmounting all drives");
+        _log.Info("?? Unmounting all drives");
         var configIds = _activeMounts.Keys.ToList();
+        
         foreach (var id in configIds)
         {
-            UnmountDrive(id);
+            await UnmountDrive(id);
         }
+        
+        // Also cleanup any stray rclone mounts
+        await _rcloneService.CleanupAllMountsAsync();
     }
     
     private string GetAvailableDriveLetter(string preferred)
@@ -246,111 +248,13 @@ public class VirtualDriveService
         return !drives.Any(d => d.Name.StartsWith(driveLetter, StringComparison.OrdinalIgnoreCase));
     }
     
-    private bool MapNetworkDrive(string driveLetter, string mountName, string targetPath)
-    {
-        try
-        {
-            // Ensure drive letter format
-            if (!driveLetter.EndsWith(":"))
-                driveLetter = driveLetter + ":";
-            
-            System.Diagnostics.Debug.WriteLine($"Creating subst drive: {driveLetter} -> {targetPath}");
-            
-            // Create subst drive
-            var substCommand = $"subst {driveLetter} \"{targetPath}\"";
-            var processInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c {substCommand}",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            
-            using var process = System.Diagnostics.Process.Start(processInfo);
-            if (process != null)
-            {
-                process.WaitForExit();
-                var output = process.StandardOutput.ReadToEnd();
-                var error = process.StandardError.ReadToEnd();
-                
-                if (!string.IsNullOrEmpty(output))
-                    System.Diagnostics.Debug.WriteLine($"Subst output: {output}");
-                if (!string.IsNullOrEmpty(error))
-                    System.Diagnostics.Debug.WriteLine($"Subst error: {error}");
-            }
-            
-            // Verify the drive was created
-            System.Threading.Thread.Sleep(500);
-            var wasCreated = IsDriveLetterAvailable(driveLetter) == false;
-            System.Diagnostics.Debug.WriteLine($"Drive {driveLetter} created: {wasCreated}");
-            return wasCreated;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"MapNetworkDrive failed: {ex.Message}");
-            return false;
-        }
-    }
-    
-    private bool DisconnectNetworkDrive(string driveLetter)
-    {
-        try
-        {
-            // Ensure drive letter format
-            if (!driveLetter.EndsWith(":"))
-                driveLetter = driveLetter + ":";
-            
-            System.Diagnostics.Debug.WriteLine($"Removing subst drive: {driveLetter}");
-                
-            // Remove subst drive
-            var substCommand = $"subst {driveLetter} /D";
-            var processInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c {substCommand}",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            
-            using var process = System.Diagnostics.Process.Start(processInfo);
-            if (process != null)
-            {
-                process.WaitForExit();
-                var output = process.StandardOutput.ReadToEnd();
-                var error = process.StandardError.ReadToEnd();
-                
-                if (!string.IsNullOrEmpty(output))
-                    System.Diagnostics.Debug.WriteLine($"Subst /D output: {output}");
-                if (!string.IsNullOrEmpty(error))
-                    System.Diagnostics.Debug.WriteLine($"Subst /D error: {error}");
-            }
-            
-            // Verify drive was removed
-            System.Threading.Thread.Sleep(500);
-            var wasRemoved = IsDriveLetterAvailable(driveLetter);
-            System.Diagnostics.Debug.WriteLine($"Drive {driveLetter} removed: {wasRemoved}");
-            
-            return true;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"DisconnectNetworkDrive failed: {ex.Message}");
-            return false;
-        }
-    }
-    
     private void SetDriveLabel(string driveLetter, string label)
     {
         try
         {
-            // Ensure drive letter format
             var letter = driveLetter.TrimEnd(':');
             
-            System.Diagnostics.Debug.WriteLine($"Setting drive label for {letter}: to '{label}'");
+            _log.Debug($"??? Setting drive label for {letter}: to '{label}'");
             
             // Set volume label using registry
             var keyPath = $@"Software\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\{letter}\DefaultLabel";
@@ -358,47 +262,14 @@ public class VirtualDriveService
             if (key != null)
             {
                 key.SetValue("", label);
-                System.Diagnostics.Debug.WriteLine($"Drive label set successfully");
             }
             
-            // Also try using label command (works better for subst drives)
-            var labelCommand = $"label {letter}: \"{label}\"";
-            var processInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c {labelCommand}",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            
-            using var process = System.Diagnostics.Process.Start(processInfo);
-            process?.WaitForExit();
-            
-            // Refresh Explorer to show new label
+            // Refresh Explorer
             RefreshExplorer();
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"SetDriveLabel failed: {ex.Message}");
-        }
-    }
-    
-    private void SetDriveIcon(string driveLetter, string iconPath)
-    {
-        try
-        {
-            var letter = driveLetter.TrimEnd(':');
-            var keyPath = $@"Software\Classes\Applications\Explorer.exe\Drives\{letter}\DefaultIcon";
-            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(keyPath);
-            key?.SetValue("", iconPath);
-            
-            RefreshExplorer();
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"SetDriveIcon failed: {ex.Message}");
+            _log.Warning($"?? SetDriveLabel failed: {ex.Message}");
         }
     }
     
@@ -423,8 +294,6 @@ public class VirtualDriveService
         public Guid ConfigId { get; set; }
         public string DriveLetter { get; set; } = string.Empty;
         public string MountName { get; set; } = string.Empty;
-        public string CacheRoot { get; set; } = string.Empty;
-        public S3SmartCache? SmartCache { get; set; }
-        public S3Service? S3Service { get; set; }
+        public string RemoteName { get; set; } = string.Empty;
     }
 }

@@ -277,6 +277,15 @@
                                       Foreground="{StaticResource SuccessBrush}"/>
                         </StackPanel>
                     </Border>
+                    
+                    <Button Content="📋 View Logs" 
+                           Background="{StaticResource AccentBlueBrush}"
+                           Foreground="White"
+                           Style="{StaticResource ModernButton}"
+                           Margin="12,0,0,0" 
+                           Padding="12,6"
+                           Click="ViewLogsButton_Click"
+                           ToolTip="View application activity logs"/>
                 </StackPanel>
                 
                 <TextBlock Grid.Column="1" 

@@ -11,6 +11,7 @@ using System.Windows.Shapes;
 using S3Mount.ViewModels;
 using S3Mount.Services;
 using S3Mount.Helpers;
+using S3Mount.Views;
 
 namespace S3Mount
 {
@@ -20,6 +21,7 @@ namespace S3Mount
     public partial class MainWindow : Window
     {
         private readonly MainViewModel _viewModel;
+        private LogViewerWindow? _logViewerWindow;
         
         public MainWindow(MainViewModel viewModel)
         {
@@ -29,6 +31,23 @@ namespace S3Mount
             
             // Enable dark mode for title bar
             WindowHelper.EnableDarkModeForWindow(this);
+            
+            // Log application start
+            LogService.Instance.Info("=== S3Mount Application Started ===");
+        }
+        
+        private void ViewLogsButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_logViewerWindow == null || !_logViewerWindow.IsLoaded)
+            {
+                _logViewerWindow = new LogViewerWindow();
+                _logViewerWindow.Show();
+            }
+            else
+            {
+                _logViewerWindow.Activate();
+                _logViewerWindow.Focus();
+            }
         }
         
         private void Window_StateChanged(object sender, EventArgs e)

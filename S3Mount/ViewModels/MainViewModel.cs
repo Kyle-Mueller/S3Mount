@@ -94,7 +94,7 @@ public partial class MainViewModel : ObservableObject
         if (wasMounted)
         {
             System.Diagnostics.Debug.WriteLine($"EditMountAsync - Unmounting {config.MountName} before edit");
-            _driveService.UnmountDrive(config.Id);
+            await _driveService.UnmountDrive(config.Id);
         }
         
         var dialog = new Views.MountConfigurationDialog();
@@ -182,7 +182,7 @@ public partial class MainViewModel : ObservableObject
             // Unmount if currently mounted
             if (config.IsMounted)
             {
-                _driveService.UnmountDrive(config.Id);
+                await _driveService.UnmountDrive(config.Id);
             }
             
             _credentialService.DeleteConfiguration(config.Id);
@@ -202,7 +202,7 @@ public partial class MainViewModel : ObservableObject
             if (config.IsMounted)
             {
                 System.Diagnostics.Debug.WriteLine($"ToggleMountAsync - Unmounting {config.MountName}");
-                var success = _driveService.UnmountDrive(config.Id);
+                var success = await _driveService.UnmountDrive(config.Id);
                 if (success)
                 {
                     System.Diagnostics.Debug.WriteLine($"ToggleMountAsync - Successfully unmounted {config.MountName}");

@@ -183,28 +183,58 @@ public partial class MountConfigurationViewModel : ObservableObject
         }
         
         IsTestingConnection = true;
-        TestResult = "Testing connection...";
+        TestResult = "?? Testing connection...";
         
         try
         {
-            var testConfig = new S3MountConfiguration
+            var rcloneService = new RcloneService();
+            var credManager = new CredentialManagerService();
+            
+            // Check if rclone is available
+            if (!rcloneService.IsRcloneAvailable())
             {
-                BucketName = BucketName,
-                ServiceUrl = ServiceUrl,
-                Region = Region,
-                ForcePathStyle = ForcePathStyle,
-                AccessKey = AccessKey,
-                SecretKey = SecretKey
-            };
+                TestResult = "? rclone.exe not found. Please download it from rclone.org";
+                return;
+            }
             
-            var s3Service = new S3Service();
-            s3Service.Initialize(testConfig);
+            // Create a temporary remote name for testing
+            var tempRemoteName = $"test_{Guid.NewGuid().ToString("N").Substring(0, 8)}";
             
-            var success = await s3Service.TestConnectionAsync();
-            
-            TestResult = success 
-                ? "? Connection successful!" 
-                : "? Connection failed. Please check your credentials.";
+            try
+            {
+                // Store temp credentials
+                credManager.StoreCredentials(tempRemoteName, AccessKey, SecretKey);
+                
+                // Configure temp remote
+                var configured = await rcloneService.ConfigureRemoteAsync(
+                    tempRemoteName,
+                    SelectedProvider?.Name ?? "Custom",
+                    ServiceUrl,
+                    Region,
+                    AccessKey,
+                    SecretKey,
+                    ForcePathStyle
+                );
+                
+                if (!configured)
+                {
+                    TestResult = "? Failed to configure test connection";
+                    return;
+                }
+                
+                // Test connection
+                var success = await rcloneService.TestConnectionAsync(tempRemoteName, BucketName);
+                
+                TestResult = success 
+                    ? "? Connection successful!" 
+                    : "? Connection failed. Please check your credentials and bucket name.";
+            }
+            finally
+            {
+                // Clean up temp remote
+                await rcloneService.RemoveRemoteAsync(tempRemoteName);
+                credManager.DeleteCredentials(tempRemoteName);
+            }
         }
         catch (Exception ex)
         {
